@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>BlueSlideShow</title>
+<title>BlueSlideShow - フォルダ診断版</title>
 <style>
 :root{
   --bg:#000;
@@ -96,6 +96,13 @@ details.ctrlpanel[open]{padding-bottom:12px}
 #plist li.curr{background:#132239;color:#fff;border-left:3px solid var(--accent)}
 #plist li.hidden{display:none}
 #plist li:active{transform:scale(.995)}
+.filebox{min-width:0}
+.listTools{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px;color:var(--muted);font-size:13px}
+.listTools button{font-size:13px;padding:6px 10px}
+#loadInfo{padding:9px 11px;border:1px solid #24314a;border-radius:10px;color:var(--muted);font-size:13px;line-height:1.5;background:#080e17;overflow-wrap:anywhere}
+#loadInfo[data-state="loading"]{color:#cee5ff;border-color:#3574aa}
+#loadInfo[data-state="ok"]{color:#b2e1cd;border-color:#267053}
+#loadInfo[data-state="warn"]{color:#f0d7a2;border-color:#74603a}
 .help{border:1px solid #172033;border-radius:10px;padding:10px;background:#03060a;overflow:auto;max-height:32dvh;line-height:1.6}
 .on{border-color:var(--accent);box-shadow:0 0 0 1px rgba(74,163,255,.28) inset}
 .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#111927;border:1px solid #263248;border-radius:6px;padding:1px 5px;color:#e6f0ff}
@@ -125,10 +132,13 @@ details.ctrlpanel[open]{padding-bottom:12px}
         <input id="pickFiles" type="file" multiple accept=".jpg,.jpeg,.png,.gif,.webp,.bmp,.avif,image/*">
       </label>
       <label>フォルダ選択
-        <input id="pickFolder" type="file" multiple webkitdirectory directory accept=".jpg,.jpeg,.png,.gif,.webp,.bmp,.avif,image/*">
+        <!-- フォルダ選択時の accept は外す。画像の判定は選択後に行う。 -->
+        <input id="pickFolder" type="file" multiple webkitdirectory directory>
       </label>
       <button id="fullscreen" disabled>フルスクリーン</button>
     </div>
+
+    <div id="loadInfo" role="status" aria-live="polite" style="margin-top:10px">フォルダを選ぶと、動画なども含めてファイル一覧の取得が始まります。画像以外は再生から除外します。</div>
 
     <div class="row" style="margin-top:10px">
       <input id="filter" type="text" placeholder="検索（この結果だけ再生/シャッフル対象）例: 旅行 / 2024 / .jpg">
@@ -173,12 +183,17 @@ details.ctrlpanel[open]{padding-bottom:12px}
   </div>
 
   <div class="side" id="side">
-    <ul id="plist"></ul>
+    <div class="filebox">
+      <ul id="plist"></ul>
+      <div class="listTools"><span id="listCount">一覧は最大200件ずつ表示</span><button type="button" id="showMore" hidden>さらに200件表示</button></div>
+    </div>
     <div class="help">
       <small>
         <b>操作</b><br>
         <span class="kbd">Space</span> 再生/停止　<span class="kbd">←</span>/<span class="kbd">→</span> 前へ/次へ　<span class="kbd">F</span> フルスクリーン<br>
         ※画像はブラウザ内でローカル表示します。サーバーへアップロードしません。<br>
+        ※フォルダ選択で「開く」後にSafariへ戻らない場合は、Safariの処理が始まる前の問題の可能性があります。まず画像2〜3枚だけの小さなフォルダで試してください。<br>
+        ※動画はスライドショーの対象外です（フォルダの一覧取得には含まれます）。<br>
         ※GitHub Pagesで使う場合も、画像フォルダは毎回ユーザー操作で選択します。ブラウザの安全制限です。<br>
         ※iPhone/iPadではSafariの制限により、完全な全画面ではなく疑似フルスクリーン表示になる場合があります。終了は画面タップまたはEscです。
       </small>
@@ -196,6 +211,9 @@ details.ctrlpanel[open]{padding-bottom:12px}
   const plist = document.getElementById('plist');
   const hitBadge = document.getElementById('hitBadge');
   const progressbar = document.getElementById('progressbar');
+  const loadInfo = document.getElementById('loadInfo');
+  const showMore = document.getElementById('showMore');
+  const listCount = document.getElementById('listCount');
   const side = document.getElementById('side');
 
   const pickFiles = document.getElementById('pickFiles');
@@ -228,6 +246,16 @@ details.ctrlpanel[open]{padding-bottom:12px}
   let progressTimer = null;
   let startedAt = 0;
   let intervalMs = 5000;
+  let visibleLimit = 200;
+  let lastMarkedLi = null;
+  let selectionVersion = 0;
+  let filterTimer = null;
+
+  function setInfo(message, state=''){
+    loadInfo.textContent = message;
+    loadInfo.dataset.state = state;
+  }
+  const yieldUI = () => new Promise(resolve => setTimeout(resolve, 0));
 
   const imageExts = new Set(['jpg','jpeg','png','gif','webp','bmp','avif']);
 
@@ -281,39 +309,53 @@ details.ctrlpanel[open]{padding-bottom:12px}
   }
 
   function highlightCurrent(allowScroll){
-    const lis = plist.querySelectorAll('li');
-    lis.forEach(li=>li.classList.remove('curr'));
+    if(lastMarkedLi) lastMarkedLi.classList.remove('curr');
+    lastMarkedLi = null;
     if(nowIndex == null) return;
-    const li = lis[nowIndex];
+    const li = plist.querySelector(`li[data-i="${nowIndex}"]`);
     if(!li) return;
     li.classList.add('curr');
-    if(allowScroll && chkFollow.checked && !li.classList.contains('hidden')){
-      li.scrollIntoView({block:'nearest'});
+    lastMarkedLi = li;
+    if(allowScroll && chkFollow.checked){
+      // 操作中のページ全体ではなく、画像リスト内をスクロールする。
+      const listRect = plist.getBoundingClientRect();
+      const liRect = li.getBoundingClientRect();
+      if(liRect.top < listRect.top) plist.scrollTop -= (listRect.top - liRect.top);
+      else if(liRect.bottom > listRect.bottom) plist.scrollTop += (liRect.bottom - listRect.bottom);
     }
   }
 
-  function applyFilterUI(){
-    const inSet = new Set(order);
-    const lis = plist.querySelectorAll('li');
-    lis.forEach(li=>{
-      const i = Number(li.dataset.i);
-      const keepNow = (nowIndex != null && i === nowIndex);
-      li.classList.toggle('hidden', !(inSet.has(i) || keepNow));
-    });
-    highlightCurrent(true);
-  }
-
+  // 選択した画像の全件をDOMへ投入すると、iPhoneでは固まりやすい。
+  // 最初は200件だけ生成し、必要に応じて追加表示する。
   function renderList(){
-    plist.innerHTML = '';
-    files.forEach((f,i)=>{
+    const q = (filterInput.value || '').trim().toLowerCase();
+    const frag = document.createDocumentFragment();
+    let shown = 0;
+    for(let i=0; i<files.length && shown<visibleLimit; i++){
+      const f = files[i];
+      if(q && !keyLabel(f).toLowerCase().includes(q)) continue;
       const li = document.createElement('li');
       li.textContent = keyLabel(f);
       li.dataset.i = String(i);
-      li.addEventListener('click', ()=>{ prepareIndex(i); start(); });
-      plist.appendChild(li);
-    });
-    applyFilterUI();
+      frag.appendChild(li);
+      shown++;
+    }
+    plist.replaceChildren(frag);
+    lastMarkedLi = null;
+    const total = order.length;
+    listCount.textContent = `${shown.toLocaleString('ja-JP')} / ${total.toLocaleString('ja-JP')} 件表示`;
+    showMore.hidden = shown >= total;
+    highlightCurrent(false);
   }
+
+  plist.addEventListener('click', e=>{
+    const li = e.target.closest('li[data-i]');
+    if(li){prepareIndex(Number(li.dataset.i));start();}
+  });
+  showMore.addEventListener('click', ()=>{
+    visibleLimit += 200;
+    renderList();
+  });
 
   function rebuildQueue(keepCurrent=true){
     const q = (filterInput.value || '').trim().toLowerCase();
@@ -326,7 +368,7 @@ details.ctrlpanel[open]{padding-bottom:12px}
     order = base;
     pos = (keepCurrent && nowIndex != null) ? order.indexOf(nowIndex) : -1;
     updateStatus();
-    applyFilterUI();
+    renderList();
   }
 
   function prepareIndex(fileIndex){
@@ -341,7 +383,7 @@ details.ctrlpanel[open]{padding-bottom:12px}
     slide.style.display = 'block';
     empty.style.display = 'none';
     updateStatus();
-    applyFilterUI();
+    highlightCurrent(true);
     resetProgress();
   }
 
@@ -411,38 +453,77 @@ details.ctrlpanel[open]{padding-bottom:12px}
 
   function togglePlay(){ playing ? stop() : start(); }
 
-  function setFiles(inputFiles){
-    stop();
-    revoke();
-    const arr = Array.from(inputFiles || []);
-    const ok = arr.filter(f=>{
-      const ext = extOf(f.name);
-      return imageExts.has(ext) || (f.type && f.type.startsWith('image/'));
-    });
-    files = sortFilesStable(ok);
-    order = [];
-    pos = -1;
-    nowIndex = null;
-    slide.removeAttribute('src');
-    slide.style.display = 'none';
-    empty.style.display = 'block';
-
-    if(!files.length){
-      setButtons(false);
-      plist.innerHTML = '';
-      hitBadge.textContent = '対応画像なし';
-      status.textContent = '対応画像なし（jpg/jpeg/png/gif/webp/bmp/avif）';
+  async function setFiles(inputFiles, source){
+    const myVersion = ++selectionVersion;
+    const count = inputFiles ? inputFiles.length : 0;
+    if(!count){
+      setInfo(`${source}：ファイルが渡されませんでした。キャンセル、空のフォルダ、またはファイル選択側の問題が考えられます。`, 'warn');
       return;
     }
 
-    setButtons(true);
-    renderList();
-    rebuildQueue(false);
-    if(order.length) prepareIndex(order[0]);
+    stop();
+    setInfo(`${source}：${count.toLocaleString('ja-JP')}項目を受け取りました。画像だけを抽出中…`, 'loading');
+    await yieldUI();
+    if(myVersion !== selectionVersion) return;
+
+    const ok = [];
+    let videoCount = 0, otherCount = 0;
+    const videoExts = new Set(['mp4','mov','m4v','avi','mkv','webm','wmv','mpg','mpeg','3gp']);
+    try{
+      for(let i=0; i<count; i++){
+        const f = inputFiles[i];
+        const ext = extOf(f.name);
+        if(imageExts.has(ext) || (f.type && f.type.startsWith('image/'))) ok.push(f);
+        else if(videoExts.has(ext) || (f.type && f.type.startsWith('video/'))) videoCount++;
+        else otherCount++;
+        if(i % 400 === 399){
+          setInfo(`${source}：${count.toLocaleString('ja-JP')}項目中 ${i+1} 項目を確認…`, 'loading');
+          await yieldUI();
+          if(myVersion !== selectionVersion) return;
+        }
+      }
+      setInfo(`${source}：画像${ok.length.toLocaleString('ja-JP')}件を並べ替えています…`, 'loading');
+      await yieldUI();
+      if(myVersion !== selectionVersion) return;
+      files = sortFilesStable(ok);
+      order = [];
+      pos = -1;
+      nowIndex = null;
+      visibleLimit = 200;
+      revoke();
+      slide.removeAttribute('src');
+      slide.style.display = 'none';
+      empty.style.display = 'block';
+      if(!files.length){
+        setButtons(false);
+        plist.replaceChildren();
+        showMore.hidden = true;
+        listCount.textContent = '表示する画像がありません';
+        hitBadge.textContent = '対応画像なし';
+        status.textContent = '対応画像なし（jpg/jpeg/png/gif/webp/bmp/avif）';
+        setInfo(`${source}：${count}項目、動画${videoCount}件、その他${otherCount}件。対応する画像がありません。`, 'warn');
+        return;
+      }
+      setButtons(true);
+      rebuildQueue(false);
+      if(order.length) prepareIndex(order[0]);
+      setInfo(`${source}：画像${files.length.toLocaleString('ja-JP')}件を読み込みました（動画${videoCount.toLocaleString('ja-JP')}件、その他${otherCount.toLocaleString('ja-JP')}件は除外）。`, 'ok');
+    }catch(err){
+      setInfo(`選択後の処理でエラーが発生しました：${String(err && err.message || err)}`, 'warn');
+    }
   }
 
-  pickFiles.addEventListener('change', e=>setFiles(e.target.files));
-  pickFolder.addEventListener('change', e=>setFiles(e.target.files));
+  pickFiles.addEventListener('click', ()=>{
+    pickFiles.value = '';
+    setInfo('画像選択画面を開きました。画像を選んでください。');
+  });
+  pickFolder.addEventListener('click', ()=>{
+    pickFolder.value = '';
+    setInfo('フォルダ選択画面を開きました。「開く」後、Safariが画像一覧を受け取るまで時間がかかることがあります。', 'loading');
+  });
+  pickFiles.addEventListener('change', e=>setFiles(e.target.files, '画像選択'));
+  pickFolder.addEventListener('change', e=>setFiles(e.target.files, 'フォルダ選択'));
+  pickFolder.addEventListener('cancel', ()=>setInfo('フォルダ選択がキャンセルされました。再度選択できます。'));
 
   btnPlay.addEventListener('click', togglePlay);
   btnNext.addEventListener('click', ()=>{ next(); if(playing) scheduleNext(); });
@@ -472,15 +553,18 @@ details.ctrlpanel[open]{padding-bottom:12px}
       const k = files.findIndex(f=>keyLabel(f) === keepKey);
       nowIndex = k >= 0 ? k : nowIndex;
     }
-    renderList();
     rebuildQueue(true);
   });
 
   filterInput.addEventListener('input', ()=>{
-    rebuildQueue(true);
-    if(order.length && (nowIndex == null || !order.includes(nowIndex))) prepareIndex(order[0]);
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(()=>{
+      visibleLimit = 200;
+      rebuildQueue(true);
+      if(order.length && (nowIndex == null || !order.includes(nowIndex))) prepareIndex(order[0]);
+    }, 130);
   });
-  clearFilter.addEventListener('click', ()=>{ filterInput.value = ''; rebuildQueue(true); });
+  clearFilter.addEventListener('click', ()=>{ clearTimeout(filterTimer); filterInput.value = ''; visibleLimit = 200; rebuildQueue(true); });
   chkFollow.addEventListener('change', ()=>highlightCurrent(true));
   fitMode.addEventListener('change', ()=>{ slide.style.objectFit = fitMode.value; });
   slide.style.objectFit = fitMode.value;
